@@ -53,6 +53,8 @@ final class QuotaLedger
     /** 为 `$txnId` 在 `$bucket` 上预留 `$amount`。 */
     public function reserve(string $txnId, string $bucket, int $amount): void
     {
+        $now = $this->sweepExpired();
+
         if ($txnId === '') {
             throw new QuotaException('txnId 不能为空');
         }
@@ -74,13 +76,15 @@ final class QuotaLedger
             'bucket' => $bucket,
             'amount' => $amount,
             'state' => 'reserved',
-            'at' => $this->clock->now(),
+            'at' => $now,
         ];
     }
 
     /** 把 `$txnId` 的预留转为已用。 */
     public function commit(string $txnId): void
     {
+        $this->sweepExpired();
+
         $txn = $this->txns[$txnId] ?? null;
 
         if ($txn === null || $txn['state'] !== 'reserved') {
@@ -95,18 +99,37 @@ final class QuotaLedger
     /** 释放一笔尚未 commit 的预留。（本次要补的一层） */
     public function release(string $txnId): void
     {
-        throw new \LogicException('not implemented');
+        $this->sweepExpired();
+
+        $txn = $this->txns[$txnId] ?? null;
+
+        if ($txn === null || $txn['state'] !== 'reserved') {
+            throw new QuotaException('无法 release：' . $txnId);
+        }
+
+        $this->reserved[$txn['bucket']] -= $txn['amount'];
+        $this->txns[$txnId]['state'] = 'released';
     }
 
     /** 退回一笔已 commit 的交易。（本次要补的一层） */
     public function refund(string $txnId): void
     {
-        throw new \LogicException('not implemented');
+        $this->sweepExpired();
+
+        $txn = $this->txns[$txnId] ?? null;
+
+        if ($txn === null || $txn['state'] !== 'committed') {
+            throw new QuotaException('无法 refund：' . $txnId);
+        }
+
+        $this->used[$txn['bucket']] -= $txn['amount'];
+        $this->txns[$txnId]['state'] = 'refunded';
     }
 
     /** 该桶当前已用。 */
     public function used(string $bucket): int
     {
+        $this->sweepExpired();
         $this->requireBucket($bucket);
 
         return $this->used[$bucket];
@@ -115,6 +138,7 @@ final class QuotaLedger
     /** 该桶当前预留（未 commit）。 */
     public function reserved(string $bucket): int
     {
+        $this->sweepExpired();
         $this->requireBucket($bucket);
 
         return $this->reserved[$bucket];
@@ -123,6 +147,7 @@ final class QuotaLedger
     /** 该桶当前可用（容量 − 已用 − 预留）。 */
     public function available(string $bucket): int
     {
+        $this->sweepExpired();
         $this->requireBucket($bucket);
 
         return $this->capacities[$bucket] - $this->used[$bucket] - $this->reserved[$bucket];
@@ -133,5 +158,31 @@ final class QuotaLedger
         if (!array_key_exists($bucket, $this->capacities)) {
             throw new QuotaException('未知桶：' . $bucket);
         }
+    }
+
+    /**
+     * 按注入时钟回收所有到期的 reserved 交易。
+     *
+     * 每次对外操作前调用：满足 now − at >= TTL 的预留置为 expired 并从预留计数撤掉。
+     * 与手动 release 共用「状态机 + 计数一次」的语义，故重复调用幂等。
+     * 遍历顺序按 txnId 排序确定，不依赖数组插入/哈希顺序。
+     */
+    private function sweepExpired(): int
+    {
+        $now = $this->clock->now();
+
+        $ids = array_keys($this->txns);
+        sort($ids, SORT_STRING);
+
+        foreach ($ids as $id) {
+            $txn = $this->txns[$id];
+
+            if ($txn['state'] === 'reserved' && $now - $txn['at'] >= self::TTL) {
+                $this->reserved[$txn['bucket']] -= $txn['amount'];
+                $this->txns[$id]['state'] = 'expired';
+            }
+        }
+
+        return $now;
     }
 }
